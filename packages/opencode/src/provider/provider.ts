@@ -1667,17 +1667,47 @@ const layer = Layer.effect(
         // from the outer `Effect.gen` / State-init scope; by the time this
         // loader is actually invoked (during a chat session) all three are
         // guaranteed to be initialized.
+        //
+        // The loader receives the merged `options` from `provider.options`
+        // and `model.options`. Users can configure the ensemble in
+        // `opencode.json`:
+        //   {
+        //     "provider": {
+        //       "conjunto": {
+        //         "options": {
+        //           "mode": "ensemble",            // or "race"
+        //           "forceMaxReasoning": true,
+        //           "maxConcurrency": 8
+        //         }
+        //       }
+        //     }
+        //   }
         if (isProviderAllowed(ProviderV2.ID.make("conjunto")) && !disabled.has(ProviderV2.ID.make("conjunto"))) {
-          modelLoaders["conjunto"] = async (_sdk: any, _modelID: string, _options?: Record<string, any>, _model?: Model) => {
+          modelLoaders["conjunto"] = async (_sdk: any, _modelID: string, options?: Record<string, any>, _model?: Model) => {
             const { createConjuntoLanguageModel, isFreeModel } = await import("./conjunto")
+            const mode = (options?.mode as "ensemble" | "race") ?? "ensemble"
+            const forceMaxReasoning = options?.forceMaxReasoning ?? true
+            const maxConcurrency = typeof options?.maxConcurrency === "number" ? options.maxConcurrency : 8
             return createConjuntoLanguageModel({
-              maxConcurrency: 8,
+              mode,
+              forceMaxReasoning,
+              maxConcurrency,
               async members() {
                 const out: Array<{
                   providerID: string
                   modelID: string
                   displayName: string
                   language: LanguageModelV3
+                  model?: {
+                    api: { id: string; url: string; npm: string }
+                    capabilities: {
+                      reasoning: boolean
+                      toolcall: boolean
+                      temperature: boolean
+                      attachment: boolean
+                    }
+                    options: Record<string, any>
+                  }
                 }> = []
                 // `providers` is the local mutable object that becomes
                 // `state.providers`; reading it fresh on every call lets the
@@ -1702,6 +1732,18 @@ const layer = Layer.effect(
                         modelID,
                         displayName: `${provider.name} / ${model.name ?? modelID}`,
                         language,
+                        // Pass the model metadata so the ensemble can
+                        // inject per-provider max-reasoning options.
+                        model: {
+                          api: model.api,
+                          capabilities: {
+                            reasoning: model.capabilities.reasoning,
+                            toolcall: model.capabilities.toolcall,
+                            temperature: model.capabilities.temperature,
+                            attachment: model.capabilities.attachment,
+                          },
+                          options: model.options,
+                        },
                       })
                     } catch {
                       // Member failed to load (unauthenticated, SDK error,
