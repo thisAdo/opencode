@@ -41,7 +41,12 @@ export function DialogModel(props: { providerID?: string }) {
             description: provider.name,
             category,
             disabled: provider.id === "opencode" && model.id.includes("-nano"),
-            footer: model.cost?.input === 0 && provider.id === "opencode" ? "Free" : undefined,
+            footer:
+              provider.id === "conjunto"
+                ? "Conjunto"
+                : model.cost?.input === 0 && provider.id === "opencode"
+                  ? "Free"
+                  : undefined,
             onSelect: () => {
               onSelect(provider.id, model.id)
             },
@@ -79,7 +84,12 @@ export function DialogModel(props: { providerID?: string }) {
               : undefined,
             category: connected() ? provider.name : undefined,
             disabled: provider.id === "opencode" && model.includes("-nano"),
-            footer: info.cost?.input === 0 && provider.id === "opencode" ? "Free" : undefined,
+            footer:
+              provider.id === "conjunto"
+                ? "Conjunto"
+                : info.cost?.input === 0 && provider.id === "opencode"
+                  ? "Free"
+                  : undefined,
             onSelect() {
               onSelect(provider.id, model)
             },
@@ -190,7 +200,9 @@ export function sortModelOptions<T extends { footer?: string; releaseDate: strin
   if (newestFirst) return sortBy(options, [(option) => option.releaseDate, "desc"], (option) => option.title)
   return sortBy(
     options,
-    (option) => option.footer !== "Free",
+    // Conjunto first (it's the recommended ensemble mode), then Free, then the rest.
+    (option) => option.footer !== "Conjunto" && option.footer !== "Free",
+    (option) => option.footer !== "Conjunto",
     [(option) => option.releaseDate, "desc"],
     (option) => option.title,
   )

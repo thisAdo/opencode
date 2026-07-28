@@ -131,6 +131,18 @@ const BUNDLED_PROVIDERS: Record<string, () => Promise<(opts: any) => BundledSDK>
   "@ai-sdk/github-copilot": () =>
     import("@opencode-ai/core/github-copilot/copilot-provider").then((m) => m.createOpenaiCompatible),
   "venice-ai-sdk-provider": () => import("venice-ai-sdk-provider").then((m) => m.createVenice),
+  // Synthetic stub for the "conjunto" ensemble provider. The real model
+  // factory is provided by `modelLoaders["conjunto"]` (registered in the
+  // state init), so this stub is never actually used — it only exists so
+  // `resolveSDK` does not try to npm-install a non-existent package.
+  "@opencode-ai/conjunto": () =>
+    Promise.resolve(() => ({
+      languageModel: (id: string) => {
+        throw new Error(
+          `conjunto: bundled SDK stub does not provide language models. The custom model loader should have intercepted this call (model=${id}).`,
+        )
+      },
+    }) as BundledSDK),
 }
 
 type CustomModelLoader = (sdk: any, modelID: string, options?: Record<string, any>, model?: Model) => Promise<any>
@@ -199,6 +211,18 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         options: ok ? {} : { apiKey: "public" },
       }
     }),
+    // The `conjunto` provider is a synthetic ensemble: its single model
+    // `conjunto/ensemble` fans out to every connected free model in parallel
+    // and forwards the first usable stream. The actual LanguageModelV3 is
+    // built by `modelLoaders["conjunto"]` (registered after this loop in the
+    // state init), so here we only return metadata: autoload=true so the
+    // provider shows up in /models, and an empty options object so resolveSDK
+    // doesn't error trying to read baseURL/apiKey from undefined.
+    conjunto: () =>
+      Effect.succeed({
+        autoload: true,
+        options: {},
+      }),
     openai: () =>
       Effect.succeed({
         autoload: false,
@@ -1343,6 +1367,58 @@ const layer = Layer.effect(
         const catalog = mapValues(modelsDev, fromModelsDevProvider)
         const database = mapValues(catalog, toPublicInfo)
 
+        // Inject the synthetic `conjunto` provider into the catalog so it
+        // shows up in /models, can be selected from the TUI dialog, and is
+        // available to `parseModel("conjunto/ensemble")`. The provider
+        // declares a single free model `ensemble` whose `LanguageModelV3`
+        // implementation is built lazily by `modelLoaders["conjunto"]`
+        // (registered below, after the `custom(dep)` loop).
+        const conjuntoModel: Model = {
+          id: ModelV2.ID.make("ensemble"),
+          providerID: ProviderV2.ID.make("conjunto"),
+          api: {
+            id: "ensemble",
+            url: "",
+            npm: "@opencode-ai/conjunto",
+          },
+          name: "Conjunto Ensemble",
+          family: "conjunto",
+          capabilities: {
+            temperature: false,
+            reasoning: false,
+            attachment: true,
+            toolcall: true,
+            input: { text: true, audio: false, image: true, video: false, pdf: true },
+            output: { text: true, audio: false, image: false, video: false, pdf: false },
+            interleaved: false,
+          },
+          cost: {
+            input: 0,
+            output: 0,
+            cache: { read: 0, write: 0 },
+          },
+          limit: {
+            // 0 means "unknown / use member limit"; opencode treats 0 as
+            // unset when computing context windows.
+            context: 0,
+            output: 0,
+          },
+          status: "active",
+          options: {},
+          headers: {},
+          release_date: "",
+          variants: {},
+        }
+        const conjuntoProvider: Info = {
+          id: ProviderV2.ID.make("conjunto"),
+          name: "Conjunto",
+          source: "custom",
+          env: [],
+          options: {},
+          models: { ensemble: conjuntoModel },
+        }
+        database["conjunto"] = conjuntoProvider
+
         const providers: Record<ProviderV2.ID, Info> = {} as Record<ProviderV2.ID, Info>
         const languages = new Map<string, LanguageModelV3>()
         const modelLoaders: {
@@ -1576,6 +1652,67 @@ const layer = Layer.effect(
             const opts = result.options ?? {}
             const patch: Partial<Info> = providers[providerID] ? { options: opts } : { source: "custom", options: opts }
             mergeProvider(providerID, patch)
+          }
+        }
+
+        // Register the conjunto ensemble model loader. The loader builds a
+        // `ConjuntoLanguageModel` whose `members()` factory enumerates every
+        // free, connected model (excluding `conjunto` itself to avoid
+        // infinite recursion) and resolves its `LanguageModelV3` via the
+        // outer-scope `getLanguage` Effect. We use `bridge.promise` to run
+        // that Effect from inside the plain-async loader callback, preserving
+        // the runtime context (services, instance ref, workspace, ...).
+        //
+        // `getLanguage`, `state`, and `bridge` are all captured by closure
+        // from the outer `Effect.gen` / State-init scope; by the time this
+        // loader is actually invoked (during a chat session) all three are
+        // guaranteed to be initialized.
+        if (isProviderAllowed(ProviderV2.ID.make("conjunto")) && !disabled.has(ProviderV2.ID.make("conjunto"))) {
+          modelLoaders["conjunto"] = async (_sdk: any, _modelID: string, _options?: Record<string, any>, _model?: Model) => {
+            const { createConjuntoLanguageModel, isFreeModel } = await import("./conjunto")
+            return createConjuntoLanguageModel({
+              maxConcurrency: 8,
+              async members() {
+                const out: Array<{
+                  providerID: string
+                  modelID: string
+                  displayName: string
+                  language: LanguageModelV3
+                }> = []
+                // `providers` is the local mutable object that becomes
+                // `state.providers`; reading it fresh on every call lets the
+                // ensemble react to providers being connected/disabled at
+                // runtime without needing to invalidate the cached
+                // `ConjuntoLanguageModel` instance.
+                const entries = Object.entries(providers)
+                for (const [providerID, provider] of entries) {
+                  if (providerID === "conjunto") continue
+                  for (const [modelID, model] of Object.entries(provider.models)) {
+                    if (!isFreeModel(model)) continue
+                    if (model.status === "deprecated") continue
+                    if (model.status === "alpha") continue
+                    // Skip models that can't participate in agentic loops —
+                    // conjunto is most useful in /agents where tool calls
+                    // matter, and a non-tool member would just waste a slot.
+                    if (model.capabilities.toolcall === false) continue
+                    try {
+                      const language = await bridge.promise(getLanguage(model))
+                      out.push({
+                        providerID,
+                        modelID,
+                        displayName: `${provider.name} / ${model.name ?? modelID}`,
+                        language,
+                      })
+                    } catch {
+                      // Member failed to load (unauthenticated, SDK error,
+                      // etc.) — skip it silently. The ensemble will work
+                      // with whatever members did load.
+                    }
+                  }
+                }
+                return out
+              },
+            })
           }
         }
 
